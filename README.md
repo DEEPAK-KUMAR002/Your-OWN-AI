@@ -64,6 +64,10 @@ chmod +x run.sh
 ./run.sh
 ```
 
+## Deploy on Render
+
+The included `Dockerfile` and `render.yaml` configure a single Render web service that serves both the frontend and Java API from the same origin. Create a Blueprint from this repository in Render; the service health check uses `/status`. Demo vector search works without extra services. Document embedding and RAG require an Ollama server reachable by the deployed backend; set `OLLAMA_HOST`, `OLLAMA_EMBED_MODEL`, and `OLLAMA_GENERATION_MODEL` in the Render service environment to use a remotely hosted Ollama instance with the required models installed.
+
 The server listens on port `8080` by default. Set `PORT` to use another port. Ollama settings can be changed with environment variables:
 
 | Variable | Default | Purpose |
