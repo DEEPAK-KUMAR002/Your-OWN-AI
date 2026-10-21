@@ -3,9 +3,11 @@
 *.o
 *.out
 a.out
+*.class
+/out/
+/build/
 
 # Build directories
-build/
 bin/
 
 # IDE files
