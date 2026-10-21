@@ -36,7 +36,7 @@ public final class VectorDbServer {
     private static final int DEMO_DIMS = 16;
     private static final VectorStore DEMO_DB = new VectorStore(DEMO_DIMS);
     private static final DocumentStore DOCUMENT_DB = new DocumentStore();
-    private static final OllamaClient OLLAMA = new OllamaClient();
+    private static final ModelClient MODEL = new ModelClient();
 
     private VectorDbServer() { }
 
@@ -51,7 +51,7 @@ public final class VectorDbServer {
         System.out.println("=== VectorDB Engine (Java) ===");
         System.out.println("http://localhost:" + port);
         System.out.println(DEMO_DB.size() + " demo vectors | " + DEMO_DIMS + " dims | HNSW+KD-Tree+BruteForce");
-        System.out.println("Ollama: " + (OLLAMA.isAvailable() ? "ONLINE" : "OFFLINE (optional; see README)"));
+        System.out.println("AI provider: " + (MODEL.isAvailable() ? MODEL.providerName() + " ONLINE" : "OFFLINE (configure GEMINI_API_KEY or Ollama)"));
         System.out.println("Press Ctrl+C to stop.");
     }
 
@@ -127,8 +127,8 @@ public final class VectorDbServer {
             } else if (method.equals("POST") && path.equals("/doc/ask")) {
                 result = searchDocuments(readJsonBody(exchange), true);
             } else if (method.equals("GET") && path.equals("/status")) {
-                result = Map.of("ollamaAvailable", OLLAMA.isAvailable(), "embedModel", OLLAMA.embedModel,
-                        "genModel", OLLAMA.genModel, "docCount", DOCUMENT_DB.size(),
+                result = Map.of("ollamaAvailable", MODEL.isAvailable(), "provider", MODEL.providerName(),
+                        "embedModel", MODEL.embedModel(), "genModel", MODEL.genModel(), "docCount", DOCUMENT_DB.size(),
                         "docDims", DOCUMENT_DB.dimensions(), "demoDims", DEMO_DIMS,
                         "demoCount", DEMO_DB.size());
             } else if (method.equals("GET") && path.equals("/stats")) {
@@ -155,8 +155,8 @@ public final class VectorDbServer {
         List<String> chunks = chunkText(text, 250, 30);
         List<List<Double>> embeddings = new ArrayList<>();
         for (String chunk : chunks) {
-            List<Double> embedding = OLLAMA.embed(chunk);
-            if (embedding.isEmpty()) throw new IllegalArgumentException("Ollama unavailable or embedding failed. Install Ollama, run ollama serve, then pull nomic-embed-text.");
+            List<Double> embedding = MODEL.embed(chunk);
+            if (embedding.isEmpty()) throw new IllegalArgumentException("AI embedding unavailable. Set GEMINI_API_KEY in Render, or configure a reachable Ollama server.");
             embeddings.add(embedding);
         }
         List<Integer> ids = new ArrayList<>();
@@ -171,8 +171,8 @@ public final class VectorDbServer {
         String question = stringField(body, "question");
         int k = positiveInt(asString(body.get("k")), 3);
         if (question.isBlank()) throw new IllegalArgumentException("need question");
-        List<Double> query = OLLAMA.embed(question);
-        if (query.isEmpty()) throw new IllegalArgumentException("Ollama unavailable or embedding failed");
+        List<Double> query = MODEL.embed(question);
+        if (query.isEmpty()) throw new IllegalArgumentException("AI embedding unavailable. Set GEMINI_API_KEY in Render, or configure a reachable Ollama server.");
         List<DocHit> hits = DOCUMENT_DB.search(query, k);
         List<Object> contexts = new ArrayList<>();
         StringBuilder context = new StringBuilder();
@@ -192,8 +192,8 @@ public final class VectorDbServer {
                 + "Use the provided context if it contains relevant information. "
                 + "If it doesn't, use your general knowledge. Do not mention the context unless useful.\n\n"
                 + "Context:\n" + context + "Question: " + question + "\n\nAnswer:";
-        String answer = OLLAMA.generate(prompt);
-        return Map.of("answer", answer, "model", OLLAMA.genModel, "contexts", contexts,
+        String answer = MODEL.generate(prompt);
+        return Map.of("answer", answer, "model", MODEL.genModel(), "contexts", contexts,
                 "docCount", DOCUMENT_DB.size());
     }
 
@@ -638,12 +638,20 @@ public final class VectorDbServer {
         }
     }
 
-    private static final class OllamaClient {
+    private static final class ModelClient {
         private final String host = System.getenv().getOrDefault("OLLAMA_HOST", "http://127.0.0.1:11434").replaceAll("/$", "");
         private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
-        private final String embedModel = System.getenv().getOrDefault("OLLAMA_EMBED_MODEL", "nomic-embed-text");
-        private final String genModel = System.getenv().getOrDefault("OLLAMA_GENERATION_MODEL", "llama3.2");
+        private final String geminiKey = System.getenv().getOrDefault("GEMINI_API_KEY", "").trim();
+        private final String ollamaEmbedModel = System.getenv().getOrDefault("OLLAMA_EMBED_MODEL", "nomic-embed-text");
+        private final String ollamaGenModel = System.getenv().getOrDefault("OLLAMA_GENERATION_MODEL", "llama3.2");
+        private final String geminiEmbedModel = System.getenv().getOrDefault("GEMINI_EMBED_MODEL", "gemini-embedding-2");
+        private final String geminiGenModel = System.getenv().getOrDefault("GEMINI_GENERATION_MODEL", "gemini-2.5-flash");
+        private boolean usingGemini() { return !geminiKey.isBlank(); }
+        String providerName() { return usingGemini() ? "Gemini" : "Ollama"; }
+        String embedModel() { return usingGemini() ? geminiEmbedModel : ollamaEmbedModel; }
+        String genModel() { return usingGemini() ? geminiGenModel : ollamaGenModel; }
         boolean isAvailable() {
+            if (usingGemini()) return true;
             try {
                 HttpRequest request = HttpRequest.newBuilder(URI.create(host + "/api/tags")).timeout(Duration.ofSeconds(4)).GET().build();
                 return client.send(request, HttpResponse.BodyHandlers.discarding()).statusCode() == 200;
@@ -651,29 +659,53 @@ public final class VectorDbServer {
         }
         List<Double> embed(String text) {
             try {
-                String json = Json.stringify(Map.of("model", embedModel, "prompt", text));
-                HttpRequest request = HttpRequest.newBuilder(URI.create(host + "/api/embeddings"))
-                        .timeout(Duration.ofSeconds(90)).header("Content-Type", "application/json")
+                String json;
+                HttpRequest.Builder builder;
+                if (usingGemini()) {
+                    json = Json.stringify(Map.of("content", Map.of("parts", List.of(Map.of("text", text))), "output_dimensionality", 768));
+                    builder = HttpRequest.newBuilder(URI.create("https://generativelanguage.googleapis.com/v1beta/models/" + geminiEmbedModel + ":embedContent"))
+                            .header("x-goog-api-key", geminiKey);
+                } else {
+                    json = Json.stringify(Map.of("model", ollamaEmbedModel, "prompt", text));
+                    builder = HttpRequest.newBuilder(URI.create(host + "/api/embeddings"));
+                }
+                HttpRequest request = builder.timeout(Duration.ofSeconds(90)).header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(json)).build();
                 HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
                 if (response.statusCode() != 200) return List.of();
                 Object parsed = Json.parse(response.body());
                 if (!(parsed instanceof Map<?, ?> map)) return List.of();
+                if (usingGemini() && map.get("embedding") instanceof Map<?, ?> embedding) return numberList(embedding.get("values"));
                 return numberList(map.get("embedding"));
             } catch (Exception ignored) { return List.of(); }
         }
         String generate(String prompt) {
             try {
-                String json = Json.stringify(Map.of("model", genModel, "prompt", prompt, "stream", false));
-                HttpRequest request = HttpRequest.newBuilder(URI.create(host + "/api/generate"))
-                        .timeout(Duration.ofSeconds(180)).header("Content-Type", "application/json")
+                String json;
+                HttpRequest.Builder builder;
+                if (usingGemini()) {
+                    json = Json.stringify(Map.of("contents", List.of(Map.of("parts", List.of(Map.of("text", prompt))))));
+                    builder = HttpRequest.newBuilder(URI.create("https://generativelanguage.googleapis.com/v1beta/models/" + geminiGenModel + ":generateContent"))
+                            .header("x-goog-api-key", geminiKey);
+                } else {
+                    json = Json.stringify(Map.of("model", ollamaGenModel, "prompt", prompt, "stream", false));
+                    builder = HttpRequest.newBuilder(URI.create(host + "/api/generate"));
+                }
+                HttpRequest request = builder.timeout(Duration.ofSeconds(180)).header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(json)).build();
                 HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() != 200) return "ERROR: Ollama returned HTTP " + response.statusCode();
+                if (response.statusCode() != 200) return "ERROR: " + providerName() + " returned HTTP " + response.statusCode();
                 Object parsed = Json.parse(response.body());
-                if (parsed instanceof Map<?, ?> map && map.get("response") instanceof String answer) return answer;
-                return "ERROR: Ollama response did not include an answer";
-            } catch (Exception ex) { return "ERROR: Ollama unavailable. Run: ollama serve"; }
+                if (parsed instanceof Map<?, ?> map) {
+                    if (!usingGemini() && map.get("response") instanceof String answer) return answer;
+                    if (usingGemini() && map.get("candidates") instanceof List<?> candidates && !candidates.isEmpty()
+                            && candidates.get(0) instanceof Map<?, ?> candidate
+                            && candidate.get("content") instanceof Map<?, ?> content
+                            && content.get("parts") instanceof List<?> parts && !parts.isEmpty()
+                            && parts.get(0) instanceof Map<?, ?> part && part.get("text") instanceof String answer) return answer;
+                }
+                return "ERROR: " + providerName() + " response did not include an answer";
+            } catch (Exception ex) { return "ERROR: AI provider unavailable"; }
         }
     }
 
